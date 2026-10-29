@@ -1,0 +1,17 @@
+# ACK list: items listed here are never re-reported.
+# Formats:  repo#N | owner/repo#N   (issue or PR number)
+#           repo:ci                 (ignore red/green CI changes for the repo)
+#           repo:dependabot         (ignore all failing Dependabot branches in the repo)
+#           repo:dependabot/<branch> (one branch)
+# Known open items (seeded):
+reticulum-wave#5
+reticulum-wave:ci
+Blood-Legacy:ci
+Blood-Legacy#1
+reticulum-hub#37
+blueprint#41
+yayo-studio#36
+rift#4
+omarchy-neon-horizon-theme#1
+oh-my-openagent#1
+synthocalypse#1

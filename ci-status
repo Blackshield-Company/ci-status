@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""ci-status: print ONLY what changed in CI / Dependabot / inbound issues & PRs
+since the last run, across every non-archived repo of the configured GitHub
+accounts. Uses the `gh` CLI only (no model calls). Python standard library.
+
+Exit 0 with no output when nothing changed. Exit 2 on errors (message on stderr),
+75 if the machine load is too high.
+"""
+import argparse
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_ACCOUNTS = ["synthalorian", "Blackshield-Company"]
+DEFAULT_SKIP = ["daedric-ledger", "daedric-ledger-backups", "synth-server-backups", "Greymarch"]
+OWNER_LOGINS = {"synthalorian"}
+IGNORED_BOTS = {"dependabot[bot]", "github-actions[bot]"}
+OWNER_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
+RED = {"failure", "timed_out", "startup_failure", "action_required"}
+GREEN = {"success"}
+MAX_LOAD = 8.0
+GH_TIMEOUT = 60
+MIN_RATE_REMAINING = 600
+
+RUNS_JQ = ('{total: .total_count, runs: [.workflow_runs[] | {id, name, head_branch, '
+           'status, conclusion, html_url, head_sha, updated_at, '
+           'repo: .head_repository.full_name}]}')
+ISSUES_JQ = ('[.[] | {number, title, user: .user.login, assoc: .author_association, '
+             'pr: (.pull_request != null), url: .html_url}]')
+
+
+class GhError(Exception):
+    def __init__(self, msg, status=None):
+        super().__init__(msg)
+        self.status = status
+
+
+# ---------------------------------------------------------------- gh wrapper
+def gh_api(path, jq=None, paginate=False):
+    """Call `gh api` and return parsed JSON. Never prints tokens."""
+    cmd = ["gh", "api", path]
+    if jq:
+        cmd += ["--jq", jq]
+    last = None
+    for attempt in range(2):
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=GH_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            last = GhError("timeout: %s" % path)
+            time.sleep(2)
+            continue
+        if p.returncode == 0:
+            out = p.stdout.strip()
+            if not out:
+                return None
+            try:
+                return json.loads(out)
+            except ValueError:
+                return out  # gh --jq prints bare strings unquoted
+        err = (p.stderr or p.stdout or "").strip().splitlines()
+        msg = err[0][:200] if err else "gh failed"
+        m = re.search(r"HTTP (\d{3})", p.stderr + p.stdout)
+        status = int(m.group(1)) if m else None
+        if status in (404, 409, 410, 451):
+            raise GhError(msg, status)
+        if status == 403 and "rate limit" in (p.stderr + p.stdout).lower():
+            raise GhError("rate limited", 403)
+        last = GhError(msg, status)
+        time.sleep(2)
+    raise last
+
+
+def list_repos(account):
+    cmd = ["gh", "repo", "list", account, "--limit", "1000", "--json",
+           "name,isArchived,defaultBranchRef"]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if p.returncode != 0:
+        raise GhError("gh repo list %s failed: %s" % (account, (p.stderr or "").strip()[:200]))
+    out = []
+    for r in json.loads(p.stdout or "[]"):
+        ref = r.get("defaultBranchRef") or {}
+        out.append({"owner": account, "name": r["name"], "archived": bool(r.get("isArchived")),
+                    "branch": ref.get("name")})
+    return out
+
+
+def rate_remaining():
+    try:
+        d = gh_api("rate_limit", jq=".resources.core.remaining")
+        return int(d)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------- ACK list
+def load_known(path):
+    """Lines: `repo#N`, `owner/repo#N`, `repo:ci`, `repo:dependabot`,
+    `repo:dependabot/<branch>`. `#`-comments (start of line) and blanks ignored."""
+    known = set()
+    if not path or not os.path.exists(path):
+        return known
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.split("  #", 1)[0].strip()
+            if not line or line.startswith("#"):
+                continue
+            known.add(line.lower())
+    return known
+
+
+def _names(owner, name):
+    return (name.lower(), ("%s/%s" % (owner, name)).lower())
+
+
+def known_item(known, owner, name, number):
+    return any("%s#%d" % (n, number) in known for n in _names(owner, name))
+
+
+def known_ci(known, owner, name):
+    return any("%s:ci" % n in known for n in _names(owner, name))
+
+
+def known_dependabot(known, owner, name, branch):
+    for n in _names(owner, name):
+        if "%s:dependabot" % n in known or ("%s:%s" % (n, branch.lower())) in known:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------- fetching
+def is_owner_item(item, owners):
+    user = (item.get("user") or "")
+    if user.lower() in {o.lower() for o in owners}:
+        return True
+    if user in IGNORED_BOTS:
+        return True  # dependabot PRs are tracked via failing branches instead
+    return item.get("assoc") in OWNER_ASSOCIATIONS
+
+
+def branch_exists(owner, name, branch):
+    try:
+        gh_api("repos/%s/%s/branches/%s" % (owner, name, urllib.parse.quote(branch, safe="/")),
+               jq=".name")
+        return True
+    except GhError as e:
+        if e.status == 404:
+            return False
+        raise
+
+
+def fetch_repo(repo, owners, sleep, exists=None):
+    """Return the per-repo state dict."""
+    exists = exists or branch_exists
+    owner, name, branch = repo["owner"], repo["name"], repo["branch"]
+    full = "%s/%s" % (owner, name)
+    state = {"default_branch": branch, "ci": None, "dependabot": {}, "items": {}}
+
+    runs = []
+    try:
+        d = gh_api("repos/%s/actions/runs?per_page=50" % full, jq=RUNS_JQ)
+        runs = (d or {}).get("runs") or []
+    except GhError as e:
+        if e.status not in (404, 409, 410, 451):
+            raise
+    time.sleep(sleep)
+
+    def latest_completed(rs):
+        for r in rs:
+            if r.get("status") == "completed":
+                return r
+        return None
+
+    def same_repo(r):  # ignore runs from forks that happen to use the same branch name
+        return (r.get("repo") or full).lower() == full.lower()
+
+    main = latest_completed([r for r in runs if r.get("head_branch") == branch and same_repo(r)])
+    if main is None and runs and branch:
+        # The 50 most recent runs may be all other branches; ask for the default branch.
+        try:
+            d = gh_api("repos/%s/actions/runs?branch=%s&status=completed&per_page=1"
+                       % (full, urllib.parse.quote(branch, safe="")), jq=RUNS_JQ)
+            main = latest_completed([r for r in (d or {}).get("runs") or [] if same_repo(r)])
+        except GhError as e:
+            if e.status not in (404, 409, 410, 451):
+                raise
+        time.sleep(sleep)
+    if main:
+        state["ci"] = {"workflow": main.get("name"), "conclusion": main.get("conclusion"),
+                       "run_id": main.get("id"), "sha": (main.get("head_sha") or "")[:10],
+                       "url": main.get("html_url")}
+
+    seen = set()
+    for r in runs:
+        b = r.get("head_branch") or ""
+        if not b.startswith("dependabot/") or b in seen or not same_repo(r):
+            continue
+        if r.get("status") != "completed":
+            continue
+        seen.add(b)
+        if r.get("conclusion") in RED:
+            if exists(owner, name, b):
+                state["dependabot"][b] = {"conclusion": r.get("conclusion"),
+                                          "workflow": r.get("name"), "url": r.get("html_url")}
+            time.sleep(sleep)
+
+    try:
+        items = gh_api("repos/%s/issues?state=open&per_page=100" % full, jq=ISSUES_JQ) or []
+    except GhError as e:
+        if e.status not in (404, 410, 451):
+            raise
+        items = []
+    time.sleep(sleep)
+    for it in items:
+        if is_owner_item(it, owners):
+            continue
+        kind = "PR" if it.get("pr") else "issue"
+        state["items"][str(it["number"])] = {"kind": kind, "title": (it.get("title") or "")[:120],
+                                             "user": it.get("user"), "url": it.get("url")}
+    return state
+
+
+# ---------------------------------------------------------------- diffing
+def diff(prev_repos, cur_repos, known, repo_meta):
+    ev = {"newly_red": [], "newly_green": [], "dependabot": [], "new_items": []}
+    for full, cur in sorted(cur_repos.items()):
+        owner, name = full.split("/", 1)
+        prev = prev_repos.get(full)
+        pci = ((prev or {}).get("ci") or {}).get("conclusion")
+        cci = (cur.get("ci") or {}).get("conclusion")
+        if not known_ci(known, owner, name):
+            if cci in RED and pci not in RED:
+                ev["newly_red"].append(dict(repo=full, **cur["ci"]))
+            elif cci in GREEN and pci in RED:
+                ev["newly_green"].append(dict(repo=full, **cur["ci"]))
+        pdep = (prev or {}).get("dependabot") or {}
+        for b, info in sorted(cur.get("dependabot", {}).items()):
+            if b not in pdep and not known_dependabot(known, owner, name, b):
+                ev["dependabot"].append(dict(repo=full, branch=b, **info))
+        pit = (prev or {}).get("items") or {}
+        for num, info in sorted(cur.get("items", {}).items(), key=lambda kv: int(kv[0])):
+            if num not in pit and not known_item(known, owner, name, int(num)):
+                ev["new_items"].append(dict(repo=full, number=int(num), **info))
+    return ev
+
+
+def has_changes(ev):
+    return any(ev.values())
+
+
+def format_text(ev):
+    lines = []
+    for e in ev["newly_red"]:
+        lines.append("RED     %s  %s: %s  %s" % (e["repo"], e.get("workflow"), e.get("conclusion"), e.get("url")))
+    for e in ev["newly_green"]:
+        lines.append("GREEN   %s  %s  %s" % (e["repo"], e.get("workflow"), e.get("url")))
+    for e in ev["dependabot"]:
+        lines.append("DEPBOT  %s  %s: %s  %s" % (e["repo"], e["branch"], e.get("conclusion"), e.get("url")))
+    for e in ev["new_items"]:
+        lines.append("NEW %-5s %s#%d  \"%s\" by %s  %s" % (e["kind"], e["repo"], e["number"], e["title"], e["user"], e["url"]))
+    return "\n".join(lines)
+
+
+def summarize(repos):
+    red = sum(1 for r in repos.values() if (r.get("ci") or {}).get("conclusion") in RED)
+    green = sum(1 for r in repos.values() if (r.get("ci") or {}).get("conclusion") in GREEN)
+    noci = sum(1 for r in repos.values() if not r.get("ci"))
+    dep = sum(len(r.get("dependabot", {})) for r in repos.values())
+    items = sum(len(r.get("items", {})) for r in repos.values())
+    return {"repos": len(repos), "ci_red": red, "ci_green": green, "ci_none_or_other": len(repos) - red - green,
+            "no_runs": noci, "failing_dependabot_branches": dep, "open_non_owner_items": items}
+
+
+# ---------------------------------------------------------------- state io
+def load_state(path):
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def save_state(path, state):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=1, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------- main
+def collect(args, owners, list_fn=list_repos, fetch_fn=fetch_repo):
+    skip = {s.lower() for s in args.skip}
+    cur, errors = {}, []
+    repos = []
+    for acct in args.accounts:
+        for r in list_fn(acct):
+            if r["archived"] or r["name"].lower() in skip:
+                continue
+            if args.only and r["name"] not in args.only:
+                continue
+            repos.append(r)
+    for r in repos:
+        full = "%s/%s" % (r["owner"], r["name"])
+        try:
+            cur[full] = fetch_fn(r, owners, args.sleep)
+        except GhError as e:
+            errors.append("%s: %s" % (full, e))
+            if e.status == 403:
+                errors.append("aborting: rate limited")
+                break
+        time.sleep(args.sleep)
+    return cur, errors
+
+
+def run(args, list_fn=list_repos, fetch_fn=fetch_repo, out=sys.stdout, err=sys.stderr):
+    owners = set(OWNER_LOGINS) | set(args.accounts)
+    known = load_known(args.known)
+    prev = load_state(args.state)
+    cur, errors = collect(args, owners, list_fn, fetch_fn)
+    prev_repos = (prev or {}).get("repos", {})
+    # Keep previous state for repos that failed to fetch (so a retry diffs correctly).
+    failed = {e.split(":", 1)[0] for e in errors if "/" in e.split(":", 1)[0]}
+    merged = dict(cur)
+    for full in failed:
+        if full in prev_repos:
+            merged[full] = prev_repos[full]
+
+    baseline = args.baseline or prev is None
+    if baseline:
+        ev = {"newly_red": [], "newly_green": [], "dependabot": [], "new_items": []}
+    else:
+        ev = diff(prev_repos, cur, known, None)
+
+    if not args.no_update:
+        save_state(args.state, {"updated": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "version": 1,
+                                "repos": merged})
+    if errors:
+        err.write("ci-status: %d problem(s): %s\n" % (len(errors), "; ".join(errors[:5])))
+    if baseline:
+        s = summarize(merged)
+        msg = ("baseline recorded: " if not args.no_update else "baseline (not saved): ") + \
+            ", ".join("%s=%s" % kv for kv in s.items())
+        if args.json:
+            out.write(json.dumps({"baseline": s}) + "\n")
+        else:
+            out.write(msg + "\n")
+        return 2 if errors else 0
+    if has_changes(ev):
+        out.write((json.dumps(ev, indent=1) if args.json else format_text(ev)) + "\n")
+    return 2 if errors else 0
+
+
+def parse_args(argv):
+    ap = argparse.ArgumentParser(description="Print only CI/issue/PR changes since the last run.")
+    ap.add_argument("--json", action="store_true", help="JSON output")
+    ap.add_argument("--no-update", action="store_true", help="do not write state.json")
+    ap.add_argument("--baseline", action="store_true",
+                    help="record current state as the baseline; print counts only")
+    ap.add_argument("--state", default=os.path.join(HERE, "state.json"))
+    ap.add_argument("--known", default=os.path.join(HERE, "known.txt"))
+    ap.add_argument("--accounts", nargs="+", default=DEFAULT_ACCOUNTS)
+    ap.add_argument("--skip", nargs="*", default=DEFAULT_SKIP)
+    ap.add_argument("--only", nargs="*", default=None, help="limit to these repo names (testing)")
+    ap.add_argument("--sleep", type=float, default=0.25, help="seconds between API calls")
+    return ap.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    try:
+        os.nice(19)
+    except OSError:
+        pass
+    try:
+        load = float(open("/proc/loadavg").read().split()[0])
+        if load > MAX_LOAD:
+            sys.stderr.write("ci-status: load %.1f > %.0f, skipping\n" % (load, MAX_LOAD))
+            return 75
+    except OSError:
+        pass
+    lock = open(os.path.join(os.path.dirname(os.path.abspath(args.state)), ".ci-status.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.stderr.write("ci-status: another run is in progress\n")
+        return 75
+    rem = rate_remaining()
+    if rem is not None and rem < MIN_RATE_REMAINING:
+        sys.stderr.write("ci-status: only %d API calls left this hour, skipping\n" % rem)
+        return 75
+    try:
+        return run(args)
+    except GhError as e:
+        sys.stderr.write("ci-status: %s\n" % e)
+        return 2
+    except (OSError, ValueError) as e:
+        sys.stderr.write("ci-status: %s\n" % e)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
