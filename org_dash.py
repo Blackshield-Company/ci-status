@@ -46,6 +46,7 @@ EST_CALLS_PER_REPO = 5  # runs + pulls + alerts + branches + jobs/commit lookups
 PAGE = 100
 SOFT_STATUSES = (404, 409, 410, 451)     # feature disabled / empty repo: treat as "nothing"
 ALERT_NA_STATUSES = (401, 403, 404)      # missing scope or alerts disabled: "n/a"
+ALERT_NA_ALL = ALERT_NA_STATUSES + tuple(s for s in SOFT_STATUSES if s not in ALERT_NA_STATUSES)
 OK_JOB_CONCLUSIONS = {"success", "skipped", "neutral", None}
 
 PULLS_JQ = ('[.[] | {number, title, user: .user.login, draft, head: .head.ref, '
@@ -90,11 +91,22 @@ def rate_info(gh):
         return None
 
 
+class BudgetExhausted(GhError):
+    """Raised instead of making a request that would cross the rate-limit reserve."""
+
+    def __init__(self, msg="rate-limit reserve reached"):
+        super().__init__(msg, rate_limited=True)
+
+
 class CountingGh:
-    def __init__(self, gh):
-        self.gh, self.calls = gh, 0
+    """Counts requests; refuses (BudgetExhausted) once `budget` calls were made."""
+
+    def __init__(self, gh, budget=None):
+        self.gh, self.calls, self.budget = gh, 0, budget
 
     def __call__(self, path, **kw):
+        if self.budget is not None and self.calls >= self.budget:
+            raise BudgetExhausted()
         self.calls += 1
         return self.gh(path, **kw)
 
@@ -150,11 +162,15 @@ def fetch_dash_repo(repo, gh, sleep=0.0, commit_dates=None, max_lookups=DEFAULT_
 
     try:
         entry["alerts"] = gh("repos/%s/dependabot/alerts?state=open&per_page=%d" % (full, PAGE),
-                             jq=ALERTS_JQ, fatal=SOFT_STATUSES + ALERT_NA_STATUSES) or []
+                             jq=ALERTS_JQ, fatal=ALERT_NA_ALL) or []
     except GhError as e:
         if e.rate_limited:
             raise
-        entry["alerts_note"] = "n/a (%s)" % e
+        if e.status in ALERT_NA_ALL:
+            entry["alerts_note"] = "n/a (%s)" % e
+        else:
+            entry["alerts_note"] = "error"
+            entry["errors"].append("alerts: %s" % e)
     time.sleep(sleep)
 
     if branch:
@@ -168,7 +184,11 @@ def fetch_dash_repo(repo, gh, sleep=0.0, commit_dates=None, max_lookups=DEFAULT_
             date = commit_dates.get(key)
             if date is None and lookups < max_lookups and b.get("sha"):
                 lookups += 1
-                date = get("branches", "repos/%s/commits/%s" % (full, b["sha"]), COMMIT_DATE_JQ)
+                try:
+                    date = get("branches", "repos/%s/commits/%s" % (full, b["sha"]), COMMIT_DATE_JQ)
+                except BudgetExhausted:
+                    # optional lookups: keep the entry, leave the remaining dates unknown
+                    lookups, date = max_lookups, None
                 if isinstance(date, str):
                     commit_dates[key] = date
                 else:
@@ -407,6 +427,7 @@ class Dash:
             self.load_repos(force=force and only is None)
         if self.opts.offline:
             self.notes.append("offline: showing cached data only")
+            self._collect_errors()
             return
         todo = [r for r in self.repos
                 if (only is None or "%s/%s" % (r["owner"], r["name"]) in only)
@@ -425,10 +446,14 @@ class Dash:
             if progress and progress(i, len(todo), full) is False:
                 self.notes.append("refresh cancelled; %d repo(s) not refreshed" % (len(todo) - i))
                 break
-            counted = CountingGh(self.gh)
+            counted = CountingGh(self.gh, None if budget is None else budget - used)
             try:
                 entry = fetch_dash_repo(r, counted, self.opts.sleep, self.cache["commit_dates"],
                                         self.opts.max_branch_lookups, self.now)
+            except BudgetExhausted:
+                self.notes.append("rate limit: reserve %d reached; %d repo(s) not refreshed"
+                                  % (self.opts.reserve, len(todo) - i))
+                break
             except GhError as e:
                 self.notes.append("rate limited by GitHub after %d/%d repo(s); showing cached data"
                                   % (i, len(todo)))
@@ -437,11 +462,17 @@ class Dash:
             finally:
                 used += counted.calls
             self.cache["repos"][full] = entry
-            self.errors.extend("%s: %s" % (full, e) for e in entry["errors"])
         if todo:
             self.rate = rate_info(self.gh) or self.rate
         self._prune()
+        self._collect_errors()
         self.save_cache()
+
+    def _collect_errors(self):
+        """Section errors of every listed repo's entry, refreshed now or served from cache."""
+        for r in self.repos:
+            full = "%s/%s" % (r["owner"], r["name"])
+            self.errors.extend("%s: %s" % (full, e) for e in (self.entry(full) or {}).get("errors") or [])
 
     def _prune(self):
         listed = {"%s/%s" % (r["owner"], r["name"]) for r in self.repos}

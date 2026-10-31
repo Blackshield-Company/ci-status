@@ -140,6 +140,19 @@ class FetchTests(Base):
         self.assertEqual(e["errors"], [])
         self.assertIsNone(od.summarize_entry(e, 90, NOW)["dependabot_alerts"])
 
+    def test_alert_server_error_is_an_error_not_na(self):
+        gh = FakeGh(alerts={"o/a": cs.GhError("HTTP 500: boom", 500)})
+        e = od.fetch_dash_repo(repos("a")[0], gh, now=lambda: NOW)
+        self.assertIsNone(e["alerts"])
+        self.assertNotIn("n/a", e["alerts_note"])
+        self.assertEqual(len(e["errors"]), 1)
+        self.assertIn("alerts: HTTP 500", e["errors"][0])
+        for status in (401, 404, 410):
+            e = od.fetch_dash_repo(repos("a")[0], FakeGh(alerts={"o/a": cs.GhError("HTTP %d" % status, status)}),
+                                   now=lambda: NOW)
+            self.assertIn("n/a", e["alerts_note"])
+            self.assertEqual(e["errors"], [])
+
     def test_alert_fetch_uses_no_retry_for_403(self):
         seen = {}
 
@@ -252,6 +265,26 @@ class DashTests(Base):
         self.assertIn("rate limit", d.notes[0])
         self.assertEqual(d.errors, [])
 
+    def test_rate_limit_reserve_enforced_per_request(self):
+        # 606 remaining, reserve 600: branch lookups must not push it below the reserve
+        br = [{"name": "main", "sha": "m"}] + [{"name": "b%d" % i, "sha": "s%d" % i} for i in range(30)]
+        gh = FakeGh(rate=(cs.MIN_RATE_REMAINING + 6, 5000), branches={"o/a": br, "o/b": br},
+                    commits={"s%d" % i: iso(400) for i in range(30)})
+        d = self.dash(gh)
+        d.refresh()
+        self.assertEqual(len([c for c in gh.calls if c != "rate_limit"]), 6)
+        self.assertGreaterEqual(d.rate["remaining"], cs.MIN_RATE_REMAINING)
+        self.assertEqual(list(d.cache["repos"]), ["o/a"])  # kept, with dates left unknown
+        self.assertEqual(od.summarize_entry(d.cache["repos"]["o/a"], 90, NOW)["unknown_branch_dates"], 28)
+        self.assertTrue(any("rate limit" in n for n in d.notes))
+        self.assertEqual(d.errors, [])
+
+    def test_budget_refuses_request_before_sending(self):
+        gh = FakeGh(runs={"o/a": [run_obj("main", "failure")]})
+        with self.assertRaises(od.BudgetExhausted):
+            od.fetch_dash_repo(repos("a")[0], od.CountingGh(gh, budget=2), now=lambda: NOW)
+        self.assertEqual(len(gh.calls), 2)
+
     def test_rate_limited_response_keeps_cache(self):
         d = self.dash(FakeGh())
         d.refresh()
@@ -329,6 +362,21 @@ class JsonTests(Base):
         self.assertEqual(rc, 2)
         self.assertIn("o/a: prs", err)
         self.assertEqual(len(rep["repos"]), 2)
+
+    def test_cached_entry_errors_reported(self):
+        gh = FakeGh(fail={"repos/o/a/pulls": cs.GhError("HTTP 500", 500)})
+        rc, _, _ = self.json_main(gh)
+        self.assertEqual(rc, 2)
+        # second run within the TTL serves o/a from cache: its errors still count
+        calls = len(gh.calls)
+        rc, rep, err = self.json_main(gh)
+        self.assertEqual(len(gh.calls), calls)
+        self.assertEqual(rc, 2)
+        self.assertIn("o/a: prs", err)
+        self.assertEqual(len(rep["errors"]), 1)
+        self.assertIn("o/a: prs", rep["errors"][0])
+        rc, rep, _ = self.json_main(gh, extra=["--offline"])
+        self.assertEqual((rc, len(rep["errors"])), (2, 1))
 
     def test_ci_status_dash_dispatch(self):
         called = {}
