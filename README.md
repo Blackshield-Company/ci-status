@@ -14,3 +14,14 @@ Reports: newly red / newly green default-branch CI (latest completed run), new f
 `known.txt` is the ACK list (`repo#N`, `repo:ci`, `repo:dependabot[/branch]`). First run with no state.json acts as a baseline.
 Sequential calls with small sleeps, `nice 19`, load guard (>8 skips, exit 75), flock against overlap, ~2 API calls per repo (~8 min).
 Exit codes: 0 ok, 2 errors (stderr), 75 skipped (load / rate limit / already running).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+## Support
+
+Donations are optional. Nothing in this tool is gated on them.
+
+- GitHub Sponsors: https://github.com/sponsors/synthalorian
+- Ko-fi: https://ko-fi.com/synthalorian
