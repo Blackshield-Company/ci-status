@@ -42,3 +42,14 @@ API use: GET requests only via `gh api` (~4 per repo plus jobs for red runs and 
 keeping cached data, once fewer than `--reserve` calls (default 600, the same floor ci-status uses) would remain or GitHub
 answers "rate limited"; remaining calls and reset time are shown in the header and in the JSON `rate_limit` field.
 `--json` exits 0, or 2 if any repo had fetch errors (listed in `errors` and on stderr).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+## Support
+
+Donations are optional. Nothing in this tool is gated on them.
+
+- GitHub Sponsors: https://github.com/sponsors/synthalorian
+- Ko-fi: https://ko-fi.com/synthalorian
