@@ -36,14 +36,19 @@ ISSUES_JQ = ('[.[] | {number, title, user: .user.login, assoc: .author_associati
 
 
 class GhError(Exception):
-    def __init__(self, msg, status=None):
+    def __init__(self, msg, status=None, rate_limited=False):
         super().__init__(msg)
         self.status = status
+        self.rate_limited = rate_limited
 
 
 # ---------------------------------------------------------------- gh wrapper
-def gh_api(path, jq=None, paginate=False):
-    """Call `gh api` and return parsed JSON. Never prints tokens."""
+FATAL_STATUSES = (404, 409, 410, 451)
+
+
+def gh_api(path, jq=None, paginate=False, fatal=FATAL_STATUSES):
+    """Call `gh api` (always a GET) and return parsed JSON. Never prints tokens.
+    HTTP statuses in `fatal` raise immediately instead of being retried."""
     cmd = ["gh", "api", path]
     if jq:
         cmd += ["--jq", jq]
@@ -67,10 +72,10 @@ def gh_api(path, jq=None, paginate=False):
         msg = err[0][:200] if err else "gh failed"
         m = re.search(r"HTTP (\d{3})", p.stderr + p.stdout)
         status = int(m.group(1)) if m else None
-        if status in (404, 409, 410, 451):
-            raise GhError(msg, status)
         if status == 403 and "rate limit" in (p.stderr + p.stdout).lower():
-            raise GhError("rate limited", 403)
+            raise GhError("rate limited", 403, rate_limited=True)
+        if status in fatal:
+            raise GhError(msg, status)
         last = GhError(msg, status)
         time.sleep(2)
     raise last
@@ -154,6 +159,24 @@ def branch_exists(owner, name, branch):
         raise
 
 
+def latest_completed(runs):
+    for r in runs:
+        if r.get("status") == "completed":
+            return r
+    return None
+
+
+def same_repo(run, full):
+    """False for runs from forks that happen to use the same branch name."""
+    return (run.get("repo") or full).lower() == full.lower()
+
+
+def ci_summary(run):
+    return {"workflow": run.get("name"), "conclusion": run.get("conclusion"),
+            "run_id": run.get("id"), "sha": (run.get("head_sha") or "")[:10],
+            "url": run.get("html_url")}
+
+
 def fetch_repo(repo, owners, sleep, exists=None):
     """Return the per-repo state dict."""
     exists = exists or branch_exists
@@ -170,35 +193,24 @@ def fetch_repo(repo, owners, sleep, exists=None):
             raise
     time.sleep(sleep)
 
-    def latest_completed(rs):
-        for r in rs:
-            if r.get("status") == "completed":
-                return r
-        return None
-
-    def same_repo(r):  # ignore runs from forks that happen to use the same branch name
-        return (r.get("repo") or full).lower() == full.lower()
-
-    main = latest_completed([r for r in runs if r.get("head_branch") == branch and same_repo(r)])
+    main = latest_completed([r for r in runs if r.get("head_branch") == branch and same_repo(r, full)])
     if main is None and runs and branch:
         # The 50 most recent runs may be all other branches; ask for the default branch.
         try:
             d = gh_api("repos/%s/actions/runs?branch=%s&status=completed&per_page=1"
                        % (full, urllib.parse.quote(branch, safe="")), jq=RUNS_JQ)
-            main = latest_completed([r for r in (d or {}).get("runs") or [] if same_repo(r)])
+            main = latest_completed([r for r in (d or {}).get("runs") or [] if same_repo(r, full)])
         except GhError as e:
             if e.status not in (404, 409, 410, 451):
                 raise
         time.sleep(sleep)
     if main:
-        state["ci"] = {"workflow": main.get("name"), "conclusion": main.get("conclusion"),
-                       "run_id": main.get("id"), "sha": (main.get("head_sha") or "")[:10],
-                       "url": main.get("html_url")}
+        state["ci"] = ci_summary(main)
 
     seen = set()
     for r in runs:
         b = r.get("head_branch") or ""
-        if not b.startswith("dependabot/") or b in seen or not same_repo(r):
+        if not b.startswith("dependabot/") or b in seen or not same_repo(r, full):
             continue
         if r.get("status") != "completed":
             continue
@@ -293,17 +305,23 @@ def save_state(path, state):
 
 
 # ---------------------------------------------------------------- main
-def collect(args, owners, list_fn=list_repos, fetch_fn=fetch_repo):
-    skip = {s.lower() for s in args.skip}
-    cur, errors = {}, []
+def select_repos(accounts, skip, only=None, list_fn=list_repos):
+    """Non-archived repos of `accounts`, minus the skip list (and limited to `only`)."""
+    skip = {s.lower() for s in skip}
     repos = []
-    for acct in args.accounts:
+    for acct in accounts:
         for r in list_fn(acct):
             if r["archived"] or r["name"].lower() in skip:
                 continue
-            if args.only and r["name"] not in args.only:
+            if only and r["name"] not in only:
                 continue
             repos.append(r)
+    return repos
+
+
+def collect(args, owners, list_fn=list_repos, fetch_fn=fetch_repo):
+    cur, errors = {}, []
+    repos = select_repos(args.accounts, args.skip, args.only, list_fn)
     for r in repos:
         full = "%s/%s" % (r["owner"], r["name"])
         try:
@@ -371,6 +389,13 @@ def parse_args(argv):
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["dash"]:
+        # The org dashboard lives in org_dash.py next to this script and reuses this module.
+        sys.modules.setdefault("ci_status", sys.modules[__name__])
+        sys.path.insert(0, HERE)
+        import org_dash
+        return org_dash.main(argv[1:])
     args = parse_args(argv)
     try:
         os.nice(19)
